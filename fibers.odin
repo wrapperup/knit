@@ -21,6 +21,7 @@ foreign fiber_helpers {
 
 	// Stores the current context into old, and sets the context to new.
 	swap_fiber_context :: proc(old: ^FiberContext, new: ^FiberContext) ---
+	fiber_exit_thunk :: proc() ---
 }
 
 when ODIN_OS == .Windows {
@@ -49,22 +50,6 @@ WorkerThread :: struct {
 	init_fiber_context: FiberContext,
 	current_fiber:      FiberId,
 	ready_tasks:        Deque(Task),
-}
-
-foo :: proc "contextless" (data: rawptr) {
-	context = runtime.default_context()
-	fmt.println("Hello from fiber!")
-}
-
-main :: proc() {
-	_worker_state_tls = &WorkerThread{}
-
-    counter := run_task({
-        foo,
-        nil,
-    })
-
-    wait_for_counter(counter)
 }
 
 FiberId :: int
@@ -98,6 +83,19 @@ TaskDecl :: struct {
 }
 
 scheduler: TaskScheduler
+
+task_scheduler_init :: proc(s: ^TaskScheduler, thread_num: int) {
+    pool_init(&s.fibers)
+    pool_init(&s.waiting_fibers)
+    pool_init(&s.counters)
+    s.workers = make([]WorkerThread, thread_num)
+
+    for &worker in s.workers {
+        deque_init(&worker.ready_tasks, 128)
+    }
+
+    _worker_state_tls = &s.workers[0]
+}
 
 run_task :: proc(decl: TaskDecl) -> CounterId {
 	counter, counter_id, counter_ok := pool_pop(&scheduler.counters)
@@ -145,20 +143,6 @@ wait_for_counter :: proc(id: CounterId) {
     switch_to_next_ready_task()
 }
 
-fiber_exit :: proc "contextless" () {
-    // Release this fiber, switch to next ready task.
-    context = runtime.default_context()
-
-	if _worker_state_tls.current_fiber != -1 {
-        pool_release(&scheduler.fibers, _worker_state_tls.current_fiber)
-        _worker_state_tls.current_fiber = -1
-
-        switch_to_next_ready_task()
-    } else {
-        unreachable()
-    }
-}
-
 switch_to_next_ready_task  :: proc() {
 	task, task_ok := deque_pop_bottom(&_worker_state_tls.ready_tasks)
 	if task_ok {
@@ -188,27 +172,4 @@ switch_to_next_ready_task  :: proc() {
         // Assuming there are no more tasks left... spinlock?
 		unreachable()
 	}
-}
-
-make_fiber_context :: proc(
-	proc_ptr: proc "contextless" (data: rawptr),
-	stack_ptr: ^u8,
-	stack_len: int,
-) -> FiberContext {
-	sp := mem.ptr_offset(stack_ptr, stack_len)
-
-	// Align stack pointer on 16-byte boundary.
-	sp = cast(^u8)mem.align_backward(sp, 16)
-
-	// win64: reserve 32 bytes of shadow space
-	sp = mem.ptr_offset(sp, -32)
-
-	sp = mem.ptr_offset(sp, -size_of(^u8))
-	(cast(^proc "contextless" ())sp)^ = fiber_exit
-
-	c: FiberContext
-	c.rip = cast(rawptr)proc_ptr
-	c.rsp = sp
-
-	return c
 }

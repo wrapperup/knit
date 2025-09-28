@@ -1,30 +1,31 @@
 package main
 
-import "core:math/rand"
-import "core:time"
-import "core:thread"
-import "core:testing"
 import "base:intrinsics"
+import "core:math/rand"
 import "core:mem"
+import "core:testing"
+import "core:thread"
+import "core:time"
 
 // Power-of-two ring buffer with owner-only growth.
 RingBuffer :: struct($T: typeid) {
-	buf:  []T,
+	buf: []T,
 }
 
 // Make with power-of-two capacity
 ring_make :: proc($T: typeid, cap_pow2: int) -> RingBuffer(T) {
 	assert(cap_pow2 > 0 && (cap_pow2 & (cap_pow2 - 1)) == 0, "Cap must be power of 2")
 	rb := RingBuffer(T) {
-		buf  = make([]T, cap_pow2),
+		buf = make([]T, cap_pow2),
 	}
 	return rb
 }
 
 ring_free :: proc(rb: ^RingBuffer($T)) {
-	if rb.buf != nil do delete(rb.buf)
-
-	rb.buf = nil
+	if rb.buf != nil {
+		delete(rb.buf)
+		rb.buf = nil
+	}
 }
 
 ring_idx :: proc(rb: ^RingBuffer($T), logical: int) -> int {
@@ -34,6 +35,7 @@ ring_idx :: proc(rb: ^RingBuffer($T), logical: int) -> int {
 ring_set :: proc(rb: ^RingBuffer($T), logical: int, v: T) {
 	rb.buf[ring_idx(rb, logical)] = v
 }
+
 ring_get :: proc(rb: ^RingBuffer($T), logical: int) -> T {
 	return rb.buf[ring_idx(rb, logical)]
 }
@@ -60,9 +62,9 @@ ring_grow_double :: proc(rb: ^RingBuffer($T), top: int, bottom: int) {
 
 
 Deque :: struct($T: typeid) {
-	ring:   RingBuffer(T),
-	top:    int, // atomic
-	bottom: int, // owner-only
+	ring:           RingBuffer(T),
+	top:            int, // atomic
+	bottom:         int, // owner-only
 }
 
 deque_init :: proc(d: ^Deque($T), initial_cap_pow2: int) {
@@ -76,7 +78,9 @@ deque_free :: proc(d: ^Deque($T)) {
 }
 
 // Owner push (bottom). Returns false only if grow fails (bounded build).
-deque_push_bottom :: proc(d: ^Deque($T), v: T) -> bool {
+deque_push_bottom :: proc(d: ^Deque($T), v: T, initial_cap_pow2 := 32) -> bool {
+	assert(d.ring.buf != nil, "Deque is not initialized")
+
 	b := d.bottom
 	t := intrinsics.atomic_load_explicit(&d.top, .Acquire)
 	if (b - t) >= len(d.ring.buf) {
@@ -91,6 +95,8 @@ deque_push_bottom :: proc(d: ^Deque($T), v: T) -> bool {
 
 // Owner pop (bottom). Returns true if got one.
 deque_pop_bottom :: proc(d: ^Deque($T)) -> (T, bool) {
+	assert(d.ring.buf != nil, "Deque is not initialized")
+
 	b := d.bottom - 1
 	d.bottom = b
 	t := intrinsics.atomic_load_explicit(&d.top, .Acquire)
@@ -99,7 +105,13 @@ deque_pop_bottom :: proc(d: ^Deque($T)) -> (T, bool) {
 		v := ring_get(&d.ring, b)
 		if t == b {
 			// single-item race
-			if _, ok := intrinsics.atomic_compare_exchange_weak_explicit(&d.top, t, t + 1, .Acq_Rel, .Acquire); ok {
+			if _, ok := intrinsics.atomic_compare_exchange_weak_explicit(
+				&d.top,
+				t,
+				t + 1,
+				.Acq_Rel,
+				.Acquire,
+			); ok {
 				d.bottom = t + 1
 				return v, true
 			} else {
@@ -119,6 +131,8 @@ deque_pop_bottom :: proc(d: ^Deque($T)) -> (T, bool) {
 
 // Thief steal (top). Returns true if got one.
 deque_steal_top :: proc(d: ^Deque($T)) -> (T, bool) {
+	assert(d.ring.buf != nil, "Deque is not initialized")
+
 	for {
 		t := intrinsics.atomic_load_explicit(&d.top, .Acquire)
 		b := intrinsics.atomic_load_explicit(&d.bottom, .Acquire) // benign race
@@ -126,7 +140,13 @@ deque_steal_top :: proc(d: ^Deque($T)) -> (T, bool) {
 			return {}, false // empty
 		}
 		v := ring_get(&d.ring, t)
-		if _, ok := intrinsics.atomic_compare_exchange_weak_explicit(&d.top, t, t + 1, .Acq_Rel, .Acquire); ok {
+		if _, ok := intrinsics.atomic_compare_exchange_weak_explicit(
+			&d.top,
+			t,
+			t + 1,
+			.Acq_Rel,
+			.Acquire,
+		); ok {
 			return v, true
 		}
 	}
@@ -139,13 +159,13 @@ stress_deque_with_threads :: proc(t: ^testing.T) {
 		b: bool,
 	}
 
-    TestDeque :: Deque(TestingStruct)
+	TestDeque :: Deque(TestingStruct)
 	deque: TestDeque
-    deque_init(&deque, 8192)
+	deque_init(&deque, 8192)
 
-    for i in 0..< 5000 {
-        deque_push_bottom(&deque, TestingStruct { a = rand.uint32() })
-    }
+	for i in 0 ..< 5000 {
+		deque_push_bottom(&deque, TestingStruct{a = rand.uint32()})
+	}
 
 	thread_pool: thread.Pool
 	thread.pool_init(&thread_pool, context.allocator, 10)
@@ -160,14 +180,14 @@ stress_deque_with_threads :: proc(t: ^testing.T) {
 
 	producer_proc :: proc(task: thread.Task) {
 		deque := cast(^TestDeque)task.data
-        for i in 0..< 100 {
-            ok := deque_push_bottom(deque, TestingStruct { a = rand.uint32() })
-            assert(ok)
-        }
+		for i in 0 ..< 100 {
+			ok := deque_push_bottom(deque, TestingStruct{a = rand.uint32()})
+			assert(ok)
+		}
 	}
 
-    // Producer thread
-    thread.pool_add_task(&thread_pool, context.allocator, producer_proc, &deque)
+	// Producer thread
+	thread.pool_add_task(&thread_pool, context.allocator, producer_proc, &deque)
 
 	for i in 1 ..= 10 {
 		thread.pool_add_task(&thread_pool, context.allocator, stealer_proc, &deque, i)
