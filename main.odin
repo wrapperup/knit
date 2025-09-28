@@ -34,7 +34,10 @@ make_fiber_context :: proc(
 	sp = cast(^u8)mem.align_backward(sp, 16)
 
     // Reserve shadow space
-	sp = mem.ptr_offset(sp, -32 - 8)
+	sp = mem.ptr_offset(sp, -32)
+
+    // Reserve return address space
+	sp = mem.ptr_offset(sp, -8)
 
 	c: FiberContext
 	c.rip = cast(rawptr)proc_ptr
