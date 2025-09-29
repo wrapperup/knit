@@ -69,3 +69,8 @@ make_fiber_context :: proc(
 
 	return c
 }
+
+check_ctx :: #force_inline proc(c: ^FiberContext) {
+	// stack pointer should be 16-aligned after subtracting 8 (call pushes ret)
+	assert((uintptr(c.rsp) & 15) == 0 || ((uintptr(c.rsp) - 8) & 15) == 0, "Unaligned RSP")
+}

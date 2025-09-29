@@ -244,11 +244,6 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false) {
 	set_fiber_context(&worker.init_fiber_context)
 }
 
-check_ctx :: #force_inline proc(c: ^FiberContext) {
-	// stack pointer should be 16-aligned after subtracting 8 (call pushes ret)
-	assert((uintptr(c.rsp) & 15) == 0 || ((uintptr(c.rsp) - 8) & 15) == 0, "Unaligned RSP")
-}
-
 _worker_entry :: proc "contextless" () {
 	context = runtime.default_context()
 

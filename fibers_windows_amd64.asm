@@ -1,3 +1,6 @@
+; ASM for setting/getting/swapping context
+; Adapted from https://graphitemaster.github.io/fibers/
+
 bits 64
 
 global get_fiber_context
