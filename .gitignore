@@ -1,3 +1,5 @@
-fibers.exe
-fibers.pdb
-fibers.rdi
+.vs/
+*.exe
+*.pdb
+*.lib
+*.rdi
