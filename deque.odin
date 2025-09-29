@@ -1,4 +1,4 @@
-package main
+package knit
 
 import "base:intrinsics"
 import "core:math/rand"
@@ -75,6 +75,15 @@ deque_init :: proc(d: ^Deque($T), initial_cap_pow2: int) {
 
 deque_free :: proc(d: ^Deque($T)) {
 	ring_free(&d.ring)
+}
+
+deque_is_empty :: proc(d: ^Deque($T)) -> bool {
+	assert(d.ring.buf != nil, "Deque is not initialized")
+
+	b := d.bottom
+	t := intrinsics.atomic_load_explicit(&d.top, .Acquire)
+
+	return t == b
 }
 
 // Owner push (bottom). Returns false only if grow fails (bounded build).

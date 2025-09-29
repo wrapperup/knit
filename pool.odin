@@ -1,4 +1,4 @@
-package main
+package knit
 
 import "base:intrinsics"
 import "core:math/rand"
@@ -18,11 +18,11 @@ PoolHeadIndex :: bit_field u64 {
 }
 
 Pool :: struct($N: int, $T: typeid) {
-	nodes: [N]T,
-	next:  [N]int,
-	head:  PoolHeadIndex, // atomic
-	state: [N]PoolState,
-    is_initialized: bool,
+	nodes:          [N]T,
+	next:           [N]int,
+	head:           PoolHeadIndex, // atomic
+	state:          [N]PoolState,
+	is_initialized: bool,
 }
 
 pool_init :: proc(p: ^Pool($N, $T)) {
@@ -34,11 +34,11 @@ pool_init :: proc(p: ^Pool($N, $T)) {
 	}
 
 	p.next[len(p.next) - 1] = -1
-    p.is_initialized = true
+	p.is_initialized = true
 }
 
-pool_pop :: proc(p: ^Pool($N, $T)) -> (^T, int, bool) {
-    assert(p.is_initialized, "Pool is not initialized")
+pool_pop :: proc(p: ^Pool($N, $T), keep_uninitialized := false) -> (^T, int, bool) {
+	assert(p.is_initialized, "Pool is not initialized")
 
 	for {
 		old_head := intrinsics.atomic_load_explicit(&p.head, .Acquire)
@@ -51,9 +51,10 @@ pool_pop :: proc(p: ^Pool($N, $T)) -> (^T, int, bool) {
 		new_head.index = new_head_index
 		new_head.gen = old_head.gen + 1
 
-		if value, ok := intrinsics.atomic_compare_exchange_weak(&p.head, old_head, new_head);
-		   ok {
-			p.nodes[old_head.index] = {}
+		if value, ok := intrinsics.atomic_compare_exchange_weak(&p.head, old_head, new_head); ok {
+			if !keep_uninitialized {
+				p.nodes[old_head.index] = {}
+			}
 			p.state[old_head.index] = .InUse
 			return &p.nodes[old_head.index], old_head.index, true
 		}
@@ -61,7 +62,7 @@ pool_pop :: proc(p: ^Pool($N, $T)) -> (^T, int, bool) {
 }
 
 pool_release :: proc(p: ^Pool($N, $T), index: int) {
-    assert(p.is_initialized, "Pool is not initialized")
+	assert(p.is_initialized, "Pool is not initialized")
 	assert(p.state[index] == .InUse, "Double free")
 
 	p.state[index] = .Free
@@ -74,15 +75,14 @@ pool_release :: proc(p: ^Pool($N, $T), index: int) {
 		new_head.index = index
 		new_head.gen = old_head.gen + 1
 
-		if value, ok := intrinsics.atomic_compare_exchange_weak(&p.head, old_head, new_head);
-		   ok {
+		if value, ok := intrinsics.atomic_compare_exchange_weak(&p.head, old_head, new_head); ok {
 			return
 		}
 	}
 }
 
 pool_get :: proc(p: ^Pool($N, $T), index: int) -> ^T {
-    assert(p.is_initialized, "Pool is not initialized")
+	assert(p.is_initialized, "Pool is not initialized")
 	return &p.nodes[index]
 }
 
