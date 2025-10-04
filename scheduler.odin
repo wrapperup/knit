@@ -53,8 +53,8 @@ TaskScheduler :: struct {
 	fibers:          Pool(160, Fiber),
 	waiting_fibers:  Pool(160, WaitingFiber),
 	counters:        Pool(1024, Counter),
-	task_lock:       SpinLock,
-	task_queue:      Deque(Task), // TODO: This should probably not live here.
+	task_lock:       SpinLock, // TODO: Swap to lock-free MPMC queue, or queue per thread (+worksteal)
+	task_queue:      Deque(Task), // TODO: This is not thread-safe when dealing with threads producing tasks.
 	workers:         []Worker,
 	threads:         []^thread.Thread,
 	num_outstanding: int,
