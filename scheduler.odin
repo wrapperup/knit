@@ -1,9 +1,11 @@
 package knit
 
+import "core:os"
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
 import "core:mem"
+import "core:thread"
 
 @(private, thread_local)
 _worker_index: int
@@ -35,7 +37,7 @@ requeue_waiting_fibers :: proc(counter: ^Counter) {
 		n := pool_get(&_scheduler.waiting_fibers, i)
 		next := n.next // store raw next when using NIL scheme
 
-		deque_push_bottom(&get_current_worker().ready_fibers, n.fiber)
+		deque_push_bottom(&get_worker().ready_fibers, n.fiber)
 		pool_release(&_scheduler.waiting_fibers, i)
 
 		i = next
@@ -44,16 +46,19 @@ requeue_waiting_fibers :: proc(counter: ^Counter) {
 
 WaitingFiber :: struct {
 	fiber: FiberId,
-	next:  int, // index = next - 1 (0 is none)
+	next:  int,
 }
 
 TaskScheduler :: struct {
-	fibers:         Pool(160, Fiber),
-	waiting_fibers: Pool(160, WaitingFiber),
-	counters:       Pool(1024, Counter),
-	task_queue:     Deque(Task), // TODO: This should probably not live here.
-	workers:        []Worker,
-	tasks_count:    int,
+	fibers:          Pool(160, Fiber),
+	waiting_fibers:  Pool(160, WaitingFiber),
+	counters:        Pool(1024, Counter),
+	task_lock:       SpinLock,
+	task_queue:      Deque(Task), // TODO: This should probably not live here.
+	workers:         []Worker,
+	threads:         []^thread.Thread,
+	num_outstanding: int,
+	is_running:      bool,
 }
 
 TaskDecl :: struct {
@@ -63,12 +68,29 @@ TaskDecl :: struct {
 
 _scheduler: TaskScheduler
 
-init :: proc(thread_num: int) {
+thread_worker_proc :: proc(t: ^thread.Thread) {
+	_worker_index = t.user_index
+	for true {
+		if intrinsics.atomic_load(&_scheduler.num_outstanding) > 0 {
+			swap_to_next_ready_fiber(in_worker_thread = true)
+		}
+	}
+}
+
+init :: proc(thread_num: int = 0) {
+    thread_num := thread_num
+    assert(thread_num <= os.processor_core_count())
+
+    if thread_num == 0 {
+        thread_num = os.processor_core_count()
+    }
+
 	pool_init(&_scheduler.fibers)
 	pool_init(&_scheduler.waiting_fibers)
 	pool_init(&_scheduler.counters)
 	deque_init(&_scheduler.task_queue, 128)
-	_scheduler.tasks_count = 0
+	_scheduler.num_outstanding = 0
+	_scheduler.is_running = true
 
 	_scheduler.workers = make([]Worker, thread_num)
 	for &worker in _scheduler.workers {
@@ -76,13 +98,40 @@ init :: proc(thread_num: int) {
 		deque_init(&worker.ready_fibers, 128)
 	}
 
-	// TODO: Spin up threads.
+	// -1 because the main thread is included.
+	_scheduler.threads = make([]^thread.Thread, thread_num - 1)
+	for &t, i in _scheduler.threads {
+		t = thread.create(thread_worker_proc)
+		t.user_index = i + 1
+        thread_lock_to_core(t, uint(i + 1))
+		thread.start(t)
+	}
 
 	// Main thread gets index 0 always.
 	_worker_index = 0
 }
 
-get_current_worker :: proc() -> ^Worker {
+destroy :: proc() {
+	// Free allocated stacks in each Fiber
+	intrinsics.atomic_store(&_scheduler.is_running, false)
+
+	for &t, i in _scheduler.threads {
+		thread.destroy(t)
+	}
+
+	for &fiber in _scheduler.fibers.nodes {
+		if fiber.stack != nil {
+			free(fiber.stack)
+		}
+	}
+
+	delete(_scheduler.workers)
+	delete(_scheduler.threads)
+
+	deque_free(&_scheduler.task_queue)
+}
+
+get_worker :: proc() -> ^Worker {
 	return &_scheduler.workers[_worker_index]
 }
 
@@ -102,6 +151,7 @@ task :: proc {
 run_tasks :: proc(decls: []TaskDecl) -> CounterId {
 	counter, counter_id, counter_ok := pool_pop(&_scheduler.counters)
 	counter.waiting_fiber_head = -1
+	intrinsics.atomic_store_explicit(&counter.count, 0, .Release)
 	assert(counter_ok)
 
 	for decl in decls {
@@ -110,14 +160,16 @@ run_tasks :: proc(decls: []TaskDecl) -> CounterId {
 			counter = counter_id,
 		}
 
+        spin_lock(&_scheduler.task_lock)
 		deque_push_bottom(&_scheduler.task_queue, task)
+        spin_unlock(&_scheduler.task_lock)
 	}
 
 	// Increment counter.
 	intrinsics.atomic_add_explicit(&counter.count, len(decls), .Acq_Rel)
 
 	// Increment task counter
-	intrinsics.atomic_add_explicit(&_scheduler.tasks_count, len(decls), .Acq_Rel)
+	intrinsics.atomic_add(&_scheduler.num_outstanding, len(decls))
 
 	return counter_id
 }
@@ -131,91 +183,93 @@ wait_for_counter :: proc(id: CounterId) {
 	}
 
 	// Only fibers park
-	if get_current_worker().current_fiber == -1 {
-		swap_to_next_ready_fiber(release_old_fiber = false)
-		cleanup_released_fiber()
+	if get_worker().current_fiber == -1 {
+		for intrinsics.atomic_load_explicit(&c.count, .Acquire) > 0 {
+			swap_to_next_ready_fiber(release_old_fiber = false)
+			cleanup_released_fiber()
+		}
 		return
 	}
 
-    // Add our fiber to the waiting list for this counter.
-    {
-        node, idx, ok := pool_pop(&_scheduler.waiting_fibers)
-        assert(ok)
-        node.fiber = get_current_worker().current_fiber
-        node.next = -1
-        for {
-            old_head := intrinsics.atomic_load_explicit(&c.waiting_fiber_head, .Acquire)
-            node.next = old_head
-            _, ok := intrinsics.atomic_compare_exchange_weak_explicit(
-                &c.waiting_fiber_head,
-                old_head,
-                idx,
-                .Acq_Rel,
-                .Acquire,
-            )
-            if ok {
-                break
-            }
-        }
+	// Add our fiber to the waiting list for this counter.
+	{
+		node, idx, ok := pool_pop(&_scheduler.waiting_fibers)
+		assert(ok)
+		node.fiber = get_worker().current_fiber
+		node.next = -1
+		for {
+			old_head := intrinsics.atomic_load_explicit(&c.waiting_fiber_head, .Acquire)
+			node.next = old_head
+			_, ok := intrinsics.atomic_compare_exchange_weak_explicit(
+				&c.waiting_fiber_head,
+				old_head,
+				idx,
+				.Acq_Rel,
+				.Acquire,
+			)
+			if ok {
+				break
+			}
+		}
 
-        // Check if the counter decremented while we were detaching
-        if intrinsics.atomic_load_explicit(&c.count, .Acquire) == 0 {
-            head := intrinsics.atomic_exchange_explicit(&c.waiting_fiber_head, -1, .Acq_Rel)
-            i := head
-            for i != -1 {
-                n := &_scheduler.waiting_fibers.nodes[i]
-                next := n.next
-                deque_push_bottom(&get_current_worker().ready_fibers, n.fiber)
-                pool_release(&_scheduler.waiting_fibers, i)
-                i = next
-            }
-            return
-        }
-    }
+		// Check if the counter decremented while we were detaching
+		if intrinsics.atomic_load_explicit(&c.count, .Acquire) == 0 {
+			head := intrinsics.atomic_exchange_explicit(&c.waiting_fiber_head, -1, .Acq_Rel)
+			i := head
+			for i != -1 {
+				n := &_scheduler.waiting_fibers.nodes[i]
+				next := n.next
+				deque_push_bottom(&get_worker().ready_fibers, n.fiber)
+				pool_release(&_scheduler.waiting_fibers, i)
+				i = next
+			}
+			return
+		}
+	}
 
-	assert(get_current_worker().release_fiber != get_current_worker().current_fiber)
+	assert(get_worker().release_fiber != get_worker().current_fiber)
 
 	swap_to_next_ready_fiber(release_old_fiber = false)
 	cleanup_released_fiber()
 }
 
 cleanup_released_fiber :: proc() {
-	worker := get_current_worker()
+	worker := get_worker()
 	if worker.release_fiber != -1 {
-		pool_release(&_scheduler.fibers, worker.release_fiber)
+		// pool_release(&_scheduler.fibers, worker.release_fiber)
 		worker.release_fiber = -1
 	}
 }
 
-swap_to_next_ready_fiber :: proc(release_old_fiber := false) {
-	worker := get_current_worker()
-
+swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread := false) {
 	if release_old_fiber {
-		worker.release_fiber = worker.current_fiber
+		get_worker().release_fiber = get_worker().current_fiber
 	} else {
-		worker.release_fiber = -1
+		get_worker().release_fiber = -1
 	}
 
-	// 1) Ready fibers first (do NOT gate on tasks_count)
-	if !deque_is_empty(&worker.ready_fibers) {
-		new_id, ok := deque_pop_bottom(&worker.ready_fibers)
+	// 1) Ready fibers first
+	if !deque_is_empty(&get_worker().ready_fibers) {
+		new_id, ok := deque_pop_bottom(&get_worker().ready_fibers)
 		assert(ok)
 		new_fiber := pool_get(&_scheduler.fibers, new_id)
 
-		was_from_init := worker.current_fiber == -1
+		was_from_init := get_worker().current_fiber == -1
 		if !was_from_init {
-			old := pool_get(&_scheduler.fibers, worker.current_fiber)
-			worker.current_fiber = new_id
+			old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+			get_worker().current_fiber = new_id
 			swap_fiber_context(&old.ctx, &new_fiber.ctx)
 		} else {
-			worker.current_fiber = new_id
-			swap_fiber_context(&worker.init_fiber_context, &new_fiber.ctx)
+			get_worker().current_fiber = new_id
+			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
 		}
 		return
 	}
 
 	// 2) No ready fibers; try to admit a task
+    spin_lock(&_scheduler.task_lock)
 	if task, ok := deque_pop_bottom(&_scheduler.task_queue); ok {
+        spin_unlock(&_scheduler.task_lock)
 		new_fiber, new_id, got := pool_pop(&_scheduler.fibers, keep_uninitialized = true)
 		assert(got, "Increase fiber pool")
 
@@ -226,32 +280,40 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false) {
 		}
 
 		new_fiber.ctx = make_fiber_context(_worker_entry, new_fiber.stack, 128 * 64 * 1024)
-		worker.task_to_start = task
+		get_worker().task_to_start = task
 
-		was_from_init := worker.current_fiber == -1
+		was_from_init := get_worker().current_fiber == -1
 		if !was_from_init {
-			old := pool_get(&_scheduler.fibers, worker.current_fiber)
-			worker.current_fiber = new_id
+			old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+			get_worker().current_fiber = new_id
 			swap_fiber_context(&old.ctx, &new_fiber.ctx)
 		} else {
-			worker.current_fiber = new_id
-			swap_fiber_context(&worker.init_fiber_context, &new_fiber.ctx)
+			get_worker().current_fiber = new_id
+			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
 		}
 		return
 	}
+    spin_unlock(&_scheduler.task_lock)
 
-	// 3) Nothing to run
-	set_fiber_context(&worker.init_fiber_context)
+	// 3) Try stealing a ready task from another get_worker()
+
+	// 4) Nothing to run
+	// Spinlock until done.
+
+	if get_worker().current_fiber != -1 {
+		old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+		get_worker().current_fiber = -1
+		swap_fiber_context(&old.ctx, &get_worker().init_fiber_context)
+	}
 }
 
 _worker_entry :: proc "contextless" () {
 	context = runtime.default_context()
 
-	worker := get_current_worker()
-	task := get_current_worker().task_to_start
-
 	cleanup_released_fiber()
 
+	worker := get_worker()
+	task := get_worker().task_to_start
 	task.procedure(task.data)
 
 	if task.counter != -1 {
@@ -263,7 +325,7 @@ _worker_entry :: proc "contextless" () {
 	}
 
 	// Decrement task count
-	old_count := intrinsics.atomic_sub_explicit(&_scheduler.tasks_count, 1, .Acq_Rel)
+	old_count := intrinsics.atomic_sub(&_scheduler.num_outstanding, 1)
 	assert(old_count > 0, "Task count went negative. This shouldn't happen.")
 
 	swap_to_next_ready_fiber(release_old_fiber = true)

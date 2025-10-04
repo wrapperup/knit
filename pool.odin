@@ -37,6 +37,10 @@ pool_init :: proc(p: ^Pool($N, $T)) {
 	p.is_initialized = true
 }
 
+pool_destroy :: proc(p: ^Pool($N, $T)) {
+	p.is_initialized = false
+}
+
 pool_pop :: proc(p: ^Pool($N, $T), keep_uninitialized := false) -> (^T, int, bool) {
 	assert(p.is_initialized, "Pool is not initialized")
 
