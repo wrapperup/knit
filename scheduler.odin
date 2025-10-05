@@ -40,6 +40,7 @@ requeue_waiting_fibers :: proc(wait_group: ^WaitGroup) {
 		next := n.next // store raw next when using NIL scheme
 
 		deque_push_bottom(&get_worker().ready_fibers, n.fiber)
+		sync.sema_post(&_scheduler.tasks_sem, 1)
 		pool_release(&_scheduler.waiting_fibers, i)
 
 		i = next
@@ -52,15 +53,15 @@ WaitingFiber :: struct {
 }
 
 TaskScheduler :: struct {
-	fibers:          Pool(160, Fiber),
-	waiting_fibers:  Pool(160, WaitingFiber),
-	wait_groups:     Pool(1024, WaitGroup),
-	task_lock:       SpinLock, // TODO: Swap to lock-free MPMC queue, or queue per thread (+worksteal)
-	task_queue:      Deque(Task), // TODO: This is not thread-safe when dealing with threads producing tasks.
-	workers:         []Worker,
-	threads:         []^thread.Thread,
-	is_running:      bool,
-	tasks_sem:   sync.Sema,
+	fibers:         Pool(160, Fiber),
+	waiting_fibers: Pool(160, WaitingFiber),
+	wait_groups:    Pool(1024, WaitGroup),
+	task_lock:      SpinLock, // TODO: Swap to lock-free MPMC queue, or queue per thread (+worksteal)
+	task_queue:     Deque(Task), // TODO: This is not thread-safe when dealing with threads producing tasks.
+	workers:        []Worker,
+	threads:        []^thread.Thread,
+	is_running:     bool,
+	tasks_sem:      sync.Sema,
 }
 
 TaskDecl :: struct {
@@ -74,8 +75,9 @@ thread_worker_proc :: proc(t: ^thread.Thread) {
 	_worker_index = t.user_index
 
 	for intrinsics.atomic_load(&_scheduler.is_running) {
-        sync.sema_wait_with_timeout(&_scheduler.tasks_sem, time.Nanosecond * 100)
-        swap_to_next_ready_fiber(in_worker_thread = true)
+		sync.sema_wait_with_timeout(&_scheduler.tasks_sem, time.Nanosecond * 50)
+		// Drain work
+		for swap_to_next_ready_fiber(in_worker_thread = true) {}
 	}
 }
 
@@ -119,6 +121,9 @@ destroy :: proc() {
 	for &t, i in _scheduler.threads {
 		thread.destroy(t)
 	}
+
+    tasks_sem_count := intrinsics.atomic_load_explicit(&_scheduler.tasks_sem.impl.atomic.count, .Relaxed)
+    assert (tasks_sem_count == 0)
 
 	for &fiber in _scheduler.fibers.nodes {
 		if fiber.stack != nil {
@@ -169,7 +174,6 @@ run_tasks :: proc(decls: []TaskDecl) -> WaitGroupId {
 	// Increment wait_group.
 	intrinsics.atomic_add_explicit(&wait_group.count, len(decls), .Acq_Rel)
 
-	// Increment task wait_group
 	sync.sema_post(&_scheduler.tasks_sem, len(decls))
 
 	return wait_group_id
@@ -236,7 +240,7 @@ cleanup_released_fiber :: proc() {
 	}
 }
 
-swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread := false) {
+swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread := false) -> (found_work: bool) {
 	if release_old_fiber {
 		get_worker().release_fiber = get_worker().current_fiber
 	} else {
@@ -258,7 +262,7 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 			get_worker().current_fiber = new_id
 			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
 		}
-		return
+		return true
 	}
 
 	// 2) No ready fibers; try to admit a task
@@ -287,7 +291,7 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 			get_worker().current_fiber = new_id
 			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
 		}
-		return
+		return true
 	}
 
 	// 3) Try stealing a ready task from another get_worker() TODO
@@ -298,6 +302,8 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 		get_worker().current_fiber = -1
 		swap_fiber_context(&old.ctx, &get_worker().init_fiber_context)
 	}
+
+	return false
 }
 
 _worker_entry :: proc "contextless" () {
