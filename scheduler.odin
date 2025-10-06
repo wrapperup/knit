@@ -1,5 +1,6 @@
 package knit
 
+import "core:math"
 import "base:intrinsics"
 import "base:runtime"
 import "core:fmt"
@@ -32,7 +33,7 @@ WaitGroup :: struct {
 	waiting_fiber_head: int,
 }
 
-INIT_FIBER_CONTEXT_ID_SENTINEL: int : 0xFFFFFFFFFFFFFFF
+INIT_FIBER_CONTEXT_ID_SENTINEL: int : 0x7FFFFFFF
 
 get_init_fiber_context_id :: #force_inline proc "contextless" () -> int {
     return INIT_FIBER_CONTEXT_ID_SENTINEL - _worker_index
