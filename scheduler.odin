@@ -32,6 +32,12 @@ WaitGroup :: struct {
 	waiting_fiber_head: int,
 }
 
+INIT_FIBER_CONTEXT_ID_SENTINEL: int : 0xFFFFFFFFFFFFFFF
+
+get_init_fiber_context_id :: #force_inline proc "contextless" () -> int {
+    return INIT_FIBER_CONTEXT_ID_SENTINEL - _worker_index
+}
+
 requeue_waiting_fibers :: proc(wait_group: ^WaitGroup) {
 	head := intrinsics.atomic_exchange_explicit(&wait_group.waiting_fiber_head, -1, .Acq_Rel)
 	i := head
@@ -40,7 +46,8 @@ requeue_waiting_fibers :: proc(wait_group: ^WaitGroup) {
 		next := n.next // store raw next when using NIL scheme
 
 		deque_push_bottom(&get_worker().ready_fibers, n.fiber)
-		sync.sema_post(&_scheduler.tasks_sem, 1)
+		sync.sema_post(&_scheduler.tasks_sem, 1) // Wake up threads
+
 		pool_release(&_scheduler.waiting_fibers, i)
 
 		i = next
@@ -122,8 +129,11 @@ destroy :: proc() {
 		thread.destroy(t)
 	}
 
-    tasks_sem_count := intrinsics.atomic_load_explicit(&_scheduler.tasks_sem.impl.atomic.count, .Relaxed)
-    assert (tasks_sem_count == 0)
+	tasks_sem_count := intrinsics.atomic_load_explicit(
+		&_scheduler.tasks_sem.impl.atomic.count,
+		.Relaxed,
+	)
+	assert(tasks_sem_count == 0)
 
 	for &fiber in _scheduler.fibers.nodes {
 		if fiber.stack != nil {
@@ -205,7 +215,13 @@ wait :: proc(id: WaitGroupId) {
 		for {
 			old_head := intrinsics.atomic_load_explicit(&c.waiting_fiber_head, .Acquire)
 			node.next = old_head
-			_, ok := intrinsics.atomic_compare_exchange_weak_explicit(&c.waiting_fiber_head, old_head, idx, .Acq_Rel, .Acquire)
+			_, ok := intrinsics.atomic_compare_exchange_weak_explicit(
+				&c.waiting_fiber_head,
+				old_head,
+				idx,
+				.Acq_Rel,
+				.Acquire,
+			)
 			if ok {
 				break
 			}
@@ -240,7 +256,12 @@ cleanup_released_fiber :: proc() {
 	}
 }
 
-swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread := false) -> (found_work: bool) {
+swap_to_next_ready_fiber :: proc(
+	release_old_fiber := false,
+	in_worker_thread := false,
+) -> (
+	found_work: bool,
+) {
 	if release_old_fiber {
 		get_worker().release_fiber = get_worker().current_fiber
 	} else {
@@ -255,12 +276,18 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 
 		was_from_init := get_worker().current_fiber == -1
 		if !was_from_init {
-			old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+			old_id := get_worker().current_fiber
+			old := pool_get(&_scheduler.fibers, old_id)
 			get_worker().current_fiber = new_id
-			swap_fiber_context(&old.ctx, &new_fiber.ctx)
+			swap_fiber_context_marked(&old.ctx, old_id, &new_fiber.ctx, new_id)
 		} else {
 			get_worker().current_fiber = new_id
-			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
+			swap_fiber_context_marked(
+				&get_worker().init_fiber_context,
+				get_init_fiber_context_id(),
+				&new_fiber.ctx,
+				new_id,
+			)
 		}
 		return true
 	}
@@ -284,12 +311,18 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 
 		was_from_init := get_worker().current_fiber == -1
 		if !was_from_init {
-			old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+			old_id := get_worker().current_fiber
+			old := pool_get(&_scheduler.fibers, old_id)
 			get_worker().current_fiber = new_id
-			swap_fiber_context(&old.ctx, &new_fiber.ctx)
+			swap_fiber_context_marked(&old.ctx, old_id, &new_fiber.ctx, new_id)
 		} else {
 			get_worker().current_fiber = new_id
-			swap_fiber_context(&get_worker().init_fiber_context, &new_fiber.ctx)
+			swap_fiber_context_marked(
+				&get_worker().init_fiber_context,
+				get_init_fiber_context_id(),
+				&new_fiber.ctx,
+                new_id
+			)
 		}
 		return true
 	}
@@ -298,12 +331,22 @@ swap_to_next_ready_fiber :: proc(release_old_fiber := false, in_worker_thread :=
 
 	// 4) Nothing to run
 	if get_worker().current_fiber != -1 {
-		old := pool_get(&_scheduler.fibers, get_worker().current_fiber)
+		old_id := get_worker().current_fiber
+		old := pool_get(&_scheduler.fibers, old_id)
 		get_worker().current_fiber = -1
-		swap_fiber_context(&old.ctx, &get_worker().init_fiber_context)
+		swap_fiber_context_marked(&old.ctx, old_id, &get_worker().init_fiber_context, get_init_fiber_context_id())
 	}
 
 	return false
+}
+
+swap_fiber_context_marked :: #force_inline proc(
+	old: ^FiberContext,
+	old_id: int,
+	new: ^FiberContext,
+	new_id: int,
+) {
+	swap_fiber_context(old, new)
 }
 
 _worker_entry :: proc "contextless" () {

@@ -1,10 +1,10 @@
 package main
 
-import "core:time"
-import "core:thread"
 import "base:intrinsics"
 import "core:fmt"
 import "core:math/rand"
+import "core:thread"
+import "core:time"
 
 import "../"
 
@@ -14,10 +14,10 @@ foo_atomic_counter := 0
 main :: proc() {
 	knit.init() // Automatically chooses thread_num = logical processor count
 
-    fmt.println("Sleeping for 5 seconds to test utilization...")
-    time.sleep(time.Millisecond * 5000)
+	fmt.println("Sleeping for 5 seconds to test utilization...")
+	time.sleep(time.Millisecond * 5000)
 
-    fmt.println("Kicking off tasks.")
+	fmt.println("Kicking off tasks.")
 	LEN_A :: 50
 	LEN_B :: 2
 
@@ -32,6 +32,10 @@ main :: proc() {
 		data^ = value
 	}
 
+	baz :: proc(data: ^int) {
+		data^ = 1
+	}
+
 	foo :: proc(data: ^[LEN_A]int) {
 		tasks: [LEN_A]knit.TaskDecl
 		for &task, i in tasks {
@@ -44,7 +48,7 @@ main :: proc() {
 
 	tasks: [LEN_B]knit.TaskDecl
 	for &task, i in tasks {
-		task = knit.task(foo, &results[i])
+		task = knit.task_typed(foo, &results[i])
 	}
 
 	group := knit.run_tasks(tasks[:])
@@ -52,5 +56,5 @@ main :: proc() {
 
 	fmt.println(results)
 
-    knit.destroy()
+	knit.destroy()
 }
