@@ -88,14 +88,7 @@ thread_worker_proc :: proc(t: ^thread.Thread) {
 	}
 }
 
-init :: proc(thread_num: int = 0) {
-	thread_num := thread_num
-	assert(thread_num <= os.processor_core_count())
-
-	if thread_num == 0 {
-		thread_num = os.processor_core_count()
-	}
-
+init :: proc(thread_num: int) {
 	pool_init(&_scheduler.fibers)
 	pool_init(&_scheduler.waiting_fibers)
 	pool_init(&_scheduler.wait_groups)
